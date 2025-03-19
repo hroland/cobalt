@@ -3,6 +3,7 @@ import { strict as assert } from "node:assert";
 
 import { env } from "../config.js";
 import { services } from "./service-config.js";
+import { getRedirectingURL } from "../misc/utils.js";
 import { friendlyServiceName } from "./service-alias.js";
 
 function aliasURL(url) {
@@ -97,6 +98,14 @@ function aliasURL(url) {
             if (url.hostname === 'xhslink.com' && parts.length === 3) {
                 url = new URL(`https://www.xiaohongshu.com/a/${parts[2]}`);
             }
+            break;
+
+        case "loom":
+            const idPart = parts[parts.length - 1];
+            if (idPart.length > 32) {
+                url.pathname = `/share/${idPart.slice(-32)}`;
+            }
+            break;
     }
 
     return url;
@@ -220,4 +229,18 @@ export function extract(url) {
     }
 
     return { host, patternMatch };
+}
+
+export async function resolveRedirectingURL(url, dispatcher, userAgent) {
+    const originalService = getHostIfValid(normalizeURL(url));
+    if (!originalService) return;
+
+    const canonicalURL = await getRedirectingURL(url, dispatcher, userAgent);
+    if (!canonicalURL) return;
+
+    const { host, patternMatch } = extract(normalizeURL(canonicalURL));
+
+    if (host === originalService) {
+        return patternMatch;
+    }
 }

@@ -120,9 +120,8 @@ export default async function({ host, patternMatch, params }) {
 
             case "reddit":
                 r = await reddit({
-                    sub: patternMatch.sub,
-                    id: patternMatch.id,
-                    user: patternMatch.user
+                    ...patternMatch,
+                    dispatcher,
                 });
                 break;
 
@@ -228,7 +227,8 @@ export default async function({ host, patternMatch, params }) {
 
             case "facebook":
                 r = await facebook({
-                    ...patternMatch
+                    ...patternMatch,
+                    dispatcher
                 });
                 break;
 

@@ -4,7 +4,8 @@ import { fetch } from "undici";
 import { Innertube, Session } from "youtubei.js";
 
 import { env } from "../../config.js";
-import { getCookie, updateCookieValues } from "../cookie/manager.js";
+import { getCookie } from "../cookie/manager.js";
+import { getYouTubeSession } from "../helpers/youtube-session.js";
 
 const PLAYER_REFRESH_PERIOD = 1000 * 60 * 15; // ms
 
@@ -41,43 +42,30 @@ const hlsCodecList = {
     }
 }
 
+const clientsWithNoCipher = ['IOS', 'ANDROID', 'YTSTUDIO_ANDROID', 'YTMUSIC_ANDROID'];
+
 const videoQualities = [144, 240, 360, 480, 720, 1080, 1440, 2160, 4320];
-
-const transformSessionData = (cookie) => {
-    if (!cookie)
-        return;
-
-    const values = { ...cookie.values() };
-    const REQUIRED_VALUES = ['access_token', 'refresh_token'];
-
-    if (REQUIRED_VALUES.some(x => typeof values[x] !== 'string')) {
-        return;
-    }
-
-    if (values.expires) {
-        values.expiry_date = values.expires;
-        delete values.expires;
-    } else if (!values.expiry_date) {
-        return;
-    }
-
-    return values;
-}
 
 const cloneInnertube = async (customFetch) => {
     const shouldRefreshPlayer = lastRefreshedAt + PLAYER_REFRESH_PERIOD < new Date();
 
     const rawCookie = getCookie('youtube');
-    const rawCookieValues = rawCookie?.values();
     const cookie = rawCookie?.toString();
+
+    const sessionTokens = getYouTubeSession();
+    const retrieve_player = Boolean(sessionTokens || cookie);
+
+    if (env.ytSessionServer && !sessionTokens?.potoken) {
+        throw "no_session_tokens";
+    }
 
     if (!innertube || shouldRefreshPlayer) {
         innertube = await Innertube.create({
             fetch: customFetch,
-            retrieve_player: !!cookie,
+            retrieve_player,
             cookie,
-            po_token: rawCookieValues?.po_token,
-            visitor_data: rawCookieValues?.visitor_data,
+            po_token: sessionTokens?.potoken,
+            visitor_data: sessionTokens?.visitor_data,
         });
         lastRefreshedAt = +new Date();
     }
@@ -93,32 +81,6 @@ const cloneInnertube = async (customFetch) => {
         innertube.session.cache
     );
 
-    const oauthCookie = getCookie('youtube_oauth');
-    const oauthData = transformSessionData(oauthCookie);
-
-    if (!session.logged_in && oauthData) {
-        await session.oauth.init(oauthData);
-        session.logged_in = true;
-    }
-
-    if (session.logged_in && oauthData) {
-        if (session.oauth.shouldRefreshToken()) {
-            await session.oauth.refreshAccessToken();
-        }
-
-        const cookieValues = oauthCookie.values();
-        const oldExpiry = new Date(cookieValues.expiry_date);
-        const newExpiry = new Date(session.oauth.oauth2_tokens.expiry_date);
-
-        if (oldExpiry.getTime() !== newExpiry.getTime()) {
-            updateCookieValues(oauthCookie, {
-                ...session.oauth.client_id,
-                ...session.oauth.oauth2_tokens,
-                expiry_date: newExpiry.toISOString()
-            });
-        }
-    }
-
     const yt = new Innertube(session);
     return yt;
 }
@@ -133,28 +95,24 @@ export default async function (o) {
             })
         );
     } catch (e) {
-        if (e.message?.endsWith("decipher algorithm")) {
+        if (e === "no_session_tokens") {
+            return { error: "youtube.no_session_tokens" };
+        } else if (e.message?.endsWith("decipher algorithm")) {
             return { error: "youtube.decipher" }
         } else if (e.message?.includes("refresh access token")) {
             return { error: "youtube.token_expired" }
         } else throw e;
     }
 
-    const cookie = getCookie('youtube')?.toString();
-
     let useHLS = o.youtubeHLS;
 
-    // HLS playlists don't contain the av1 video format, at least with the iOS client
-    if (useHLS && o.format === "av1") {
+    // HLS playlists don't contain the av1 video format.
+    // if the session server is used, then iOS client will not work, at least currently.
+    if (useHLS && (o.format === "av1" || env.ytSessionServer)) {
         useHLS = false;
     }
 
-    let innertubeClient = o.innertubeClient || "ANDROID";
-
-    if (cookie) {
-        useHLS = false;
-        innertubeClient = "WEB";
-    }
+    let innertubeClient = o.innertubeClient || env.customInnertubeClient || "ANDROID";
 
     if (useHLS) {
         innertubeClient = "IOS";
@@ -165,7 +123,8 @@ export default async function (o) {
         info = await yt.getBasicInfo(o.id, innertubeClient);
     } catch (e) {
         if (e?.info) {
-            const errorInfo = JSON.parse(e?.info);
+            let errorInfo;
+            try { errorInfo = JSON.parse(e?.info); } catch {}
 
             if (errorInfo?.reason === "This video is private") {
                 return { error: "content.video.private" };
@@ -192,7 +151,7 @@ export default async function (o) {
             if (playability.reason.endsWith("bot")) {
                 return { error: "youtube.login" }
             }
-            if (playability.reason.endsWith("age")) {
+            if (playability.reason.endsWith("age") || playability.reason.endsWith("inappropriate for some users.")) {
                 return { error: "content.video.age" }
             }
             if (playability?.error_screen?.reason?.text === "Private video") {
@@ -427,6 +386,10 @@ export default async function (o) {
         }
     }
 
+    if (video?.drm_families || audio?.drm_families) {
+        return { error: "youtube.drm" };
+    }
+
     const fileMetadata = {
         title: basicInfo.title.trim(),
         artist: basicInfo.author.replace("- Topic", "").trim()
@@ -473,7 +436,7 @@ export default async function (o) {
             urls = audio.uri;
         }
 
-        if (innertubeClient === "WEB" && innertube) {
+        if (!clientsWithNoCipher.includes(innertubeClient) && innertube) {
             urls = audio.decipher(innertube.session.player);
         }
 
@@ -508,7 +471,7 @@ export default async function (o) {
             filenameAttributes.resolution = `${video.width}x${video.height}`;
             filenameAttributes.extension = codecList[codec].container;
 
-            if (innertubeClient === "WEB" && innertube) {
+            if (!clientsWithNoCipher.includes(innertubeClient) && innertube) {
                 video = video.decipher(innertube.session.player);
                 audio = audio.decipher(innertube.session.player);
             } else {
